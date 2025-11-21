@@ -1,0 +1,272 @@
+name: AWS Resource Tagging
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_arns:
+        description: 'ARNs de recursos (separados por coma)'
+        required: true
+        type: string
+      custom_tags:
+        description: 'Tags a aplicar (clave1=valor1,clave2=valor2)'
+        required: true
+        type: string
+      environment:
+        description: 'Ambiente a usar'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qc
+          - pdn
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validar Parámetros
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar Entradas
+        run: |
+          echo "🔍 Validando parámetros de entrada..."
+          
+          if [ -z "${{ inputs.resource_arns }}" ]; then
+            echo "❌ ERROR: Debes proporcionar ARNs válidos"
+            exit 1
+          fi
+          
+          if [ -z "${{ inputs.custom_tags }}" ]; then
+            echo "❌ ERROR: Debes proporcionar tags válidos"
+            exit 1
+          fi
+          
+          echo "✅ Parámetros validados correctamente"
+          echo "📋 ARNs a procesar: ${{ inputs.resource_arns }}"
+          echo "🏷️  Tags a aplicar: ${{ inputs.custom_tags }}"
+
+  approve:
+    name: Aprobación Manual
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Esperando aprobación
+        run: echo "✅ Aprobación recibida para ambiente ${{ inputs.environment }}"
+
+  apply-tags:
+    name: Aplicar Tags
+    runs-on: ubuntu-latest
+    needs: approve
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3
+
+      - name: Configurar Credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar Credenciales
+        run: |
+          echo "=== CREDENCIALES INICIALES ==="
+          aws sts get-caller-identity
+          echo "=============================="
+
+      - name: Procesar Recursos
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_ARNS="${{ inputs.resource_arns }}"
+          CUSTOM_TAGS="${{ inputs.custom_tags }}"
+          
+          # Crear archivos para tracking
+          TEMP_FILE="/tmp/accounts_processing.txt"
+          SUCCESS_FILE="/tmp/successful_arns.txt"
+          FAILED_FILE="/tmp/failed_arns.txt"
+          REPORT_FILE="/tmp/detailed_report.txt"
+          
+          echo "" > "$TEMP_FILE"
+          echo "# ARNs procesados exitosamente" > "$SUCCESS_FILE"
+          echo "# ARNs que fallaron" > "$FAILED_FILE"
+          echo "# REPORTE DETALLADO DE ETIQUETADO" > "$REPORT_FILE"
+          echo "# Fecha: $(date)" >> "$REPORT_FILE"
+          echo "# Tags: $CUSTOM_TAGS" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          # Función para extraer errores
+          extract_specific_error() {
+              local output_file="$1"
+              local arn="$2"
+              local failed_file="$3"
+              
+              local error_msg=$(grep "$arn" "$output_file" | grep "Error: " | sed 's/.*Error: //' | head -1)
+              
+              if [ -n "$error_msg" ]; then
+                  echo "$arn|$error_msg" >> "$failed_file"
+              else
+                  echo "$arn|Error no específico - Revisar logs" >> "$failed_file"
+              fi
+          }
+          
+          # Procesar ARNs y agrupar por cuenta
+          IFS=',' read -ra ARN_ARRAY <<< "$RESOURCE_ARNS"
+          
+          for arn_entry in "${ARN_ARRAY[@]}"; do
+              arn_entry=$(echo "$arn_entry" | xargs)
+              
+              if [[ "$arn_entry" =~ ^\[([^,]+),([0-9]{12})\]$ ]]; then
+                  arn="${BASH_REMATCH[1]}"
+                  ACCOUNT_ID="${BASH_REMATCH[2]}"
+              else
+                  arn="$arn_entry"
+                  ACCOUNT_ID=$(echo "$arn" | grep -oP 'arn:aws:[^:]*:[^:]*:\K\d+' || echo "")
+                  
+                  if [ -z "$ACCOUNT_ID" ]; then
+                      if [[ "$arn" =~ ([0-9]{12}) ]]; then
+                          ACCOUNT_ID="${BASH_REMATCH[1]}"
+                      fi
+                  fi
+              fi
+              
+              if [ -n "$ACCOUNT_ID" ]; then
+                  echo "$ACCOUNT_ID|$arn" >> "$TEMP_FILE"
+              else
+                  echo "$arn|ERROR: No se pudo determinar Account ID" >> "$FAILED_FILE"
+              fi
+          done
+          
+          # Obtener cuentas únicas
+          UNIQUE_ACCOUNTS=$(cut -d'|' -f1 "$TEMP_FILE" | sort -u)
+          
+          TOTAL_SUCCESS=0
+          TOTAL_FAILED=0
+          
+          echo "========================================="
+          echo "📊 AGRUPANDO RECURSOS POR CUENTA:"
+          for ACCOUNT_ID in $UNIQUE_ACCOUNTS; do
+              ARN_COUNT=$(grep "^$ACCOUNT_ID|" "$TEMP_FILE" | wc -l)
+              echo "   🏦 Cuenta $ACCOUNT_ID: $ARN_COUNT recursos"
+          done
+          echo "========================================="
+          
+          # Procesar cada cuenta
+          for ACCOUNT_ID in $UNIQUE_ACCOUNTS; do
+              if [ -n "$ACCOUNT_ID" ]; then
+                  echo ""
+                  echo "========================================="
+                  echo "🏗️  PROCESANDO CUENTA: $ACCOUNT_ID"
+                  
+                  ACCOUNT_ARNS=$(grep "^$ACCOUNT_ID|" "$TEMP_FILE" | cut -d'|' -f2 | tr '\n' ',' | sed 's/,$//')
+                  ARN_COUNT=$(echo "$ACCOUNT_ARNS" | tr ',' '\n' | wc -l)
+                  
+                  echo "📊 Cantidad de recursos: $ARN_COUNT"
+                  echo "## CUENTA: $ACCOUNT_ID ($ARN_COUNT recursos)" >> "$REPORT_FILE"
+                  
+                  # Asumir rol si está configurado
+                  if [ -n "${{ secrets.AWS_ROLE_ARN_PREFIX }}" ]; then
+                      ROLE_ARN="${{ secrets.AWS_ROLE_ARN_PREFIX }}$ACCOUNT_ID:role/${{ secrets.AWS_ROLE_NAME }}"
+                      echo "🔐 Asumiendo rol: $ROLE_ARN"
+                      
+                      CREDS=$(aws sts assume-role \
+                          --role-arn "$ROLE_ARN" \
+                          --role-session-name "github-tags-$ACCOUNT_ID" \
+                          --duration-seconds 3600 2>/dev/null || echo "")
+                      
+                      if [ -n "$CREDS" ]; then
+                          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+                          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+                          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+                          echo "✅ Credenciales obtenidas"
+                      else
+                          echo "❌ Error asumiendo rol"
+                          echo "$ACCOUNT_ARNS" | tr ',' '\n' | while read -r failed_arn; do
+                              echo "$failed_arn|ERROR: No se pudo asumir rol" >> "$FAILED_FILE"
+                          done
+                          TOTAL_FAILED=$((TOTAL_FAILED + ARN_COUNT))
+                          continue
+                      fi
+                  fi
+                  
+                  # Ejecutar script
+                  PYTHON_OUTPUT="/tmp/python_output_$ACCOUNT_ID.txt"
+                  SCRIPT_EXIT_CODE=0
+                  
+                  python apply_tags.py \
+                      --resource-arns "$ACCOUNT_ARNS" \
+                      --tags "$CUSTOM_TAGS" 2>&1 | tee "$PYTHON_OUTPUT" || SCRIPT_EXIT_CODE=$?
+                  
+                  if [ $SCRIPT_EXIT_CODE -eq 0 ]; then
+                      echo "✅ Cuenta $ACCOUNT_ID procesada correctamente"
+                      echo "✅ ÉXITO" >> "$REPORT_FILE"
+                      
+                      echo "$ACCOUNT_ARNS" | tr ',' '\n' | while read -r success_arn; do
+                          [ -n "$success_arn" ] && echo "$success_arn" >> "$SUCCESS_FILE"
+                      done
+                      
+                      TOTAL_SUCCESS=$((TOTAL_SUCCESS + ARN_COUNT))
+                  else
+                      echo "❌ ERROR procesando cuenta: $ACCOUNT_ID"
+                      echo "❌ FALLO" >> "$REPORT_FILE"
+                      
+                      echo "$ACCOUNT_ARNS" | tr ',' '\n' | while read -r failed_arn; do
+                          extract_specific_error "$PYTHON_OUTPUT" "$failed_arn" "$FAILED_FILE"
+                      done
+                      
+                      TOTAL_FAILED=$((TOTAL_FAILED + ARN_COUNT))
+                  fi
+                  
+                  rm -f "$PYTHON_OUTPUT"
+                  sleep 2
+              fi
+          done
+          
+          # Reporte final
+          echo ""
+          echo "========================================="
+          echo "📊 REPORTE FINAL"
+          echo "========================================="
+          echo "✅ Recursos exitosos: $TOTAL_SUCCESS"
+          echo "❌ Recursos fallidos: $TOTAL_FAILED"
+          echo "========================================="
+          
+          if [ -s "$FAILED_FILE" ]; then
+              echo ""
+              echo "❌ RECURSOS QUE FALLARON:"
+              grep -v "^#" "$FAILED_FILE" | while IFS='|' read -r arn error; do
+                  echo "   - $arn"
+                  echo "     Error: $error"
+              done
+          fi
+          
+          # Guardar reportes como artifacts
+          cat "$REPORT_FILE"
+          
+          # Fallar si hubo errores
+          if [ $TOTAL_FAILED -gt 0 ]; then
+              exit 1
+          fi
+
+      - name: Subir Reportes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tagging-reports
+          path: /tmp/*_arns.txt
+          retention-days: 30

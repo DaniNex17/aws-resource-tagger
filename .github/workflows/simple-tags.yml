@@ -1,0 +1,61 @@
+name: AWS Tagging Simple (Sin Assume Role)
+
+# Versión simplificada para una sola cuenta AWS
+# Ideal para uso personal sin multi-cuenta
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_arns:
+        description: 'ARNs de recursos (separados por coma)'
+        required: true
+        type: string
+      custom_tags:
+        description: 'Tags a aplicar (clave1=valor1,clave2=valor2)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  apply-tags:
+    name: Aplicar Tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar boto3
+        run: pip install boto3
+
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar Credenciales
+        run: |
+          echo "✅ Verificando credenciales AWS..."
+          aws sts get-caller-identity
+
+      - name: Aplicar Tags
+        run: |
+          echo "🚀 Aplicando tags a recursos..."
+          python apply_tags.py \
+            --resource-arns "${{ inputs.resource_arns }}" \
+            --tags "${{ inputs.custom_tags }}"
+
+      - name: Resumen
+        if: success()
+        run: |
+          echo "✅ Tags aplicados exitosamente"
+          echo "📋 ARNs procesados: ${{ inputs.resource_arns }}"
+          echo "🏷️  Tags aplicados: ${{ inputs.custom_tags }}"
